@@ -22,11 +22,36 @@ from verl import DataProto
 from collections import Counter, defaultdict
 
 
-def reduce_metrics(metrics: Dict[str, List[Any]]) -> Dict[str, Any]:
-    for key, val in metrics.items():
-        metrics[key] = np.mean(val)
-    return metrics
+# def reduce_metrics(metrics: Dict[str, List[Any]]) -> Dict[str, Any]:
+#     for key, val in metrics.items():
+#         metrics[key] = np.mean(val)
+#     return metrics
 
+def reduce_metrics(metrics: dict[str, list]):
+    import numpy as np
+
+    reduced = {}
+    for key, vals in metrics.items():
+        if key.endswith("_distribution"):
+            # vals 可能是 list[np.ndarray] 或 list[list[float]]
+            flat = []
+            for v in vals:
+                if isinstance(v, (list, np.ndarray)):
+                    flat.extend(np.array(v).reshape(-1))
+                else:
+                    flat.append(float(v))
+            reduced[key] = np.array(flat, dtype=np.float32)
+            continue
+
+        # ② 其它照旧做 scalar reduce
+        if key.endswith("/max"):
+            reduced[key] = float(np.max(vals))
+        elif key.endswith("/min"):
+            reduced[key] = float(np.min(vals))
+        else:
+            reduced[key] = float(np.mean(vals))
+
+    return reduced
 
 def _compute_response_info(batch: DataProto) -> Dict[str, Any]:
     response_length = batch.batch['responses'].shape[-1]

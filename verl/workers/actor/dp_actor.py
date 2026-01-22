@@ -321,6 +321,24 @@ class DataParallelPPOActor(BasePPOActor):
                         metrics['actor/kl_loss'] = kl_loss.detach().item()
                         metrics['actor/kl_coef'] = self.config.kl_loss_coef
 
+                    valid_entropy = entropy[response_mask.bool()].detach().cpu().numpy()
+                    valid_ref_logprob = ref_log_prob[response_mask.bool()].detach().cpu().numpy()
+                    valid_logprob_diff = (log_prob - ref_log_prob)[response_mask.bool()].detach().cpu().numpy()
+                    valid_logprob = log_prob[response_mask.bool()].detach().cpu().numpy()
+                    
+                    # 使用列表来累积所有micro_batch的分布数据，确保只包含有效元素
+                    if 'dist/entropy_distribution' not in metrics:
+                        metrics['dist/entropy_distribution'] = []
+                        metrics['dist/ref_logprob_distribution'] = []
+                        metrics['dist/logprob_diff_distribution'] = []
+                        metrics['dist/logprob_distribution'] = []
+                    
+                    # 将当前micro_batch的有效数据添加到列表中累积
+                    metrics['dist/entropy_distribution'].extend(valid_entropy.tolist())
+                    metrics['dist/ref_logprob_distribution'].extend(valid_ref_logprob.tolist())
+                    metrics['dist/logprob_diff_distribution'].extend(valid_logprob_diff.tolist())
+                    metrics['dist/logprob_distribution'].extend(valid_logprob.tolist())
+                    
                     if self.config.use_dynamic_bsz:
                         # relative to the dynamic bsz
                         loss = policy_loss * (len(data) / self.config.ppo_mini_batch_size)

@@ -72,6 +72,7 @@ class AdvantageEstimator(str, Enum):
     REINFORCE_PLUS_PLUS = 'reinforce_plus_plus'
     REMAX = 'remax'
     RLOO = 'rloo'
+    OPD = 'on_policy_distillation'
 
 
 @dataclass
@@ -236,6 +237,22 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                                                                         index=index)
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+    elif adv_estimator == AdvantageEstimator.OPD:
+        responses = data.batch['responses']
+        response_length = responses.size(-1)
+        attention_mask = data.batch['attention_mask']
+        response_mask = attention_mask[:, -response_length:]   # (bs, response_len)
+        # student = old_log_probs，teacher = ref_log_prob
+        student_logprob = data.batch['old_log_probs']          # (bs, response_len)
+        teacher_logprob = data.batch['ref_log_prob']           # (bs, response_len)
+        # 每个 token 的 advantage：teacher_logprob - student_logprob
+        with torch.no_grad():
+            raw_adv = teacher_logprob - student_logprob        # (bs, response_len)
+            raw_adv = raw_adv * response_mask
+            advantages = raw_adv.clamp(-5.0, 5.0)
+        returns = advantages.clone()
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = returns
     else:
         raise NotImplementedError
     return data
@@ -304,7 +321,7 @@ class RayPPOTrainer(object):
             self.use_critic = True
         elif self.config.algorithm.adv_estimator in [
                 AdvantageEstimator.GRPO, AdvantageEstimator.REINFORCE_PLUS_PLUS, AdvantageEstimator.REMAX,
-                AdvantageEstimator.RLOO
+                AdvantageEstimator.RLOO, AdvantageEstimator.OPD
         ]:
             self.use_critic = False
         else:
@@ -1198,8 +1215,104 @@ class RayPPOTrainer(object):
                 num_gen_batches = 0
 
                 # TODO: make a canonical logger that supports various backend
-                logger.log(data=metrics, step=self.global_steps)
+                # logger.log(data=metrics, step=self.global_steps)
 
+
+
+                scalar_metrics = {}
+                dist_metrics = {}
+                
+                for key, value in metrics.items():
+                    if key.endswith("_distribution"):
+                        print(f"[DEBUG] Potential distribution key: {key}, type: {type(value)}, value: {value}")
+                    
+                    if (isinstance(value, list) or isinstance(value, np.ndarray)) and key.endswith("_distribution"):
+                        # list -> numpy 一维数组 
+                        arr = np.array(value, dtype=np.float32)
+                        dist_metrics[key] = arr
+                        base_key = key.replace("_distribution", "")
+                        mean_key = f"{base_key}_mean"
+                        std_key = f"{base_key}_std"
+                        
+                        scalar_metrics[mean_key] = float(arr.mean())
+                        scalar_metrics[std_key] = float(arr.std())
+                    
+                    else:
+                        # 其他都按 scalar 处理 
+                        scalar_metrics[key] = value
+                
+                # # 打印 scalar_metrics 中的所有键，确认统计信息已正确添加
+                # print(f"[DEBUG] All scalar metrics keys: {list(scalar_metrics.keys())}")
+                # print(f"[DEBUG] Total scalar metrics count: {len(scalar_metrics)}")
+                # print(f"[DEBUG] Distribution metrics found: {list(dist_metrics.keys())}")
+                
+                # # 2) 如果有 wandb 后端，把 dist_metrics 转成 Histogram，并且只给 wandb log 
+                # print(f"[DEBUG] Logger backends: {list(logger.logger.keys()) if hasattr(logger, 'logger') else 'No logger attribute'}")
+                # print(f"[DEBUG] Has dist_metrics: {len(dist_metrics) > 0}")
+                # print(f"[DEBUG] Full metrics content sample: {dict(list(metrics.items())[:10])}...")
+                
+                if "wandb" in logger.logger and dist_metrics:
+                    import wandb
+                    print(f"[DEBUG] Using wandb.Histogram with bins=512")
+                    hist_data = {}
+                    for key, arr in dist_metrics.items():
+                        hist_data[key] = wandb.Histogram(arr, num_bins=100)
+                        print(f"[DEBUG] Created histogram for {key} with {arr.shape[0]} data points")
+                    
+                    print(f"[DEBUG] Logging {len(hist_data)} histograms to wandb")
+                    logger.log(
+                        data=hist_data,
+                        step=self.global_steps,
+                        backend=["wandb"],  # 只发给 wandb，避免 LocalLogger / TB 被 Histogram 搞崩 
+                    )
+            
+                print(f"[DEBUG] Logging {len(scalar_metrics)} scalar metrics")
+                logger.log(data=scalar_metrics, step=self.global_steps)
+                print(f"[DEBUG] Scalar metrics logged successfully")
+         
+                if dist_metrics and self.global_steps % self.config.trainer.test_freq== 0:
+                    import os
+                    import json
+                    from datetime import datetime
+                    
+                    # 获取experiment name，如果没有设置则使用默认名称
+                    experiment_name = self.config.trainer.experiment_name
+                    project_name = self.config.trainer.project_name
+                    # 创建保存目录，包含experiment name以避免冲突
+                    save_dir = os.path.join("distribution_logs",
+                                           project_name, 
+                                           experiment_name,
+                                           f"epoch_{epoch}", 
+                                           f"step_{self.global_steps}")
+                    os.makedirs(save_dir, exist_ok=True)
+                    
+                    # 保存每个distribution
+                    for dist_key, dist_data in dist_metrics.items():
+                        # 创建文件名，替换非法字符
+                        filename = dist_key.replace("/", "_") + ".json"
+                        filepath = os.path.join(save_dir, filename)
+                        
+                        # 准备保存的数据
+                        save_data = {
+                            "step": self.global_steps,
+                            "epoch": epoch,
+                            "timestamp": datetime.now().isoformat(),
+                            "metric_name": dist_key,
+                            "mean": float(np.mean(dist_data)),
+                            "std": float(np.std(dist_data)),
+                            "percentiles": {
+                                "p10": float(np.percentile(dist_data, 10)),
+                                "p50": float(np.percentile(dist_data, 50)),
+                                "p90": float(np.percentile(dist_data, 90))
+                            },
+                            "data": dist_data.tolist()  # 转换为列表以便JSON序列化
+                        }
+                        
+                        # 保存到文件
+                        with open(filepath, 'w') as f:
+                            json.dump(save_data, f, indent=2)
+                        
+                        print(f"[DEBUG] Saved distribution {dist_key} to {filepath}")
                 if is_last_step:
                     pprint(f'Final validation metrics: {last_val_metrics}')
                     return
